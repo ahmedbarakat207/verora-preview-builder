@@ -1,0 +1,79 @@
+# Builder repo: .github/workflows/build.yml
+name: build-preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: Build id (owner-repo-sha8)
+        required: true
+
+env:
+  ID: ${{ inputs.build_id }}
+  AWS_DEFAULT_REGION: auto
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate id
+        run: echo "$ID" | grep -Eq '^[a-z0-9_.-]+$'
+
+      - name: Fetch source from storage
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET }}
+        run: |
+          aws s3 cp "s3://${{ secrets.R2_BUCKET }}/src/$ID.zip" src.zip --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+          mkdir src && unzip -q src.zip -d src
+          mv src/*/ app
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # No storage secrets in this step: it runs the app's own dependencies.
+      - name: Build Flutter web
+        working-directory: app
+        run: |
+          set -o pipefail
+          {
+            [ -d web ] || flutter create . --platforms web
+            flutter pub get
+            flutter build web --release --base-href "/$ID/"
+          } 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Publish
+        if: success()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET }}
+        run: |
+          EP="${{ secrets.R2_ENDPOINT }}"; B="s3://${{ secrets.R2_BUCKET }}"
+          aws s3 sync app/build/web "$B/$ID/" --endpoint-url "$EP"
+
+      - name: Report to site
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then OK="true"; else OK="false"; fi
+          LOG="$(tail -c 3000 build.log 2>/dev/null || echo 'Build failed before compiling.')"
+          # JSON-escape the log tail with jq (preinstalled on runners)
+          PAYLOAD=$(jq -n --arg id "$ID" --argjson ok "$OK" --arg log "$LOG" \
+            --arg url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{build_id:$id,ok:$ok,log:$log,log_url:$url}')
+          curl -s -X POST "$SITE_URL/api/proof-builds/callback" \
+            -H "Authorization: Bearer $CALLBACK_SECRET" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+
+      - name: Delete staged source
+        if: always()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET }}
+        run: aws s3 rm "s3://${{ secrets.R2_BUCKET }}/src/$ID.zip" --endpoint-url "${{ secrets.R2_ENDPOINT }}"
