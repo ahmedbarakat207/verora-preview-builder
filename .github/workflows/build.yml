@@ -34,6 +34,103 @@ jobs:
           channel: stable
           cache: true
 
+      # Fabricate a missing `.env` (or similar) so the bundle compiles:
+      # collect the key names the Dart code actually reads and write them
+      # with safe placeholder values. Runs BEFORE sanitize so the fresh
+      # stub is never stripped as "missing".
+      - name: Fabricate missing env file
+        working-directory: app
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, subprocess
+          # env filenames the pubspec declares as bundled assets
+          wanted = set()
+          try:
+              pub = open("pubspec.yaml").read()
+              in_assets = False
+              for line in pub.split("\n"):
+                  s = line.strip()
+                  if re.match(r"^assets\s*:", s):
+                      in_assets = True; continue
+                  if in_assets:
+                      if re.match(r"^[a-zA-Z0-9_\"' ]", line) and not line.startswith((" ", "\t")):
+                          in_assets = False; continue
+                      m = re.match(r"\s*-\s*[\"']?([^\"'#\s]+)", s)
+                      if m and os.path.basename(m.group(1)).startswith(".env"):
+                          wanted.add(m.group(1))
+          except FileNotFoundError:
+              pass
+          if not wanted:
+              print("preview-builder: no .env assets declared")
+              raise SystemExit
+          # key names the code reads: dotenv.env['K'], dotenv.get('K'), dotenv.maybeGet('K')
+          keys = set()
+          try:
+              out = subprocess.run(
+                  ["grep", "-rhoE", "dotenv\\.(env\\[|get\\(|maybeGet\\()['\"][A-Za-z_][A-Za-z0-9_]*", "lib"],
+                  capture_output=True, text=True).stdout
+              for hit in out.split("\n"):
+                  k = re.search(r"['\"]([A-Za-z_][A-Za-z0-9_]*)$", hit.strip())
+                  if k and len(keys) < 50:
+                      keys.add(k.group(1))
+          except Exception as e:
+              print(f"preview-builder: key scan failed ({e})")
+          for rel in sorted(wanted):
+              if os.path.exists(rel):
+                  print(f"preview-builder: {rel} already committed, keeping it")
+                  continue
+              os.makedirs(os.path.dirname(rel) or ".", exist_ok=True)
+              with open(rel, "w") as f:
+                  f.write("# Fabricated by VERORA preview builder — placeholder values only.\n")
+                  for k in sorted(keys) or ["PLACEHOLDER"]:
+                      f.write(f"{k}=preview\n")
+          print(f"preview-builder: fabricated {sorted(wanted)} with {len(keys)} keys")
+          EOF
+
+      # Drop asset entries whose files aren't committed: Flutter fails the
+      # whole bundle on one missing asset, and preview builds must never
+      # die on repo hygiene. Dropped entries are echoed so the log tail
+      # explains any runtime gap.
+      - name: Sanitize missing assets
+        working-directory: app
+        run: |
+          python3 - <<'EOF'
+          import glob, os
+          p = "pubspec.yaml"
+          if not os.path.exists(p):
+              print("no pubspec.yaml, skipping sanitize")
+              raise SystemExit
+          lines = open(p).read().split("\n")
+          out, i = [], 0
+          in_flutter, in_assets = False, False
+          while i < len(lines):
+              line, stripped = lines[i], lines[i].lstrip()
+              indent = len(line) - len(stripped)
+              if indent == 0 and stripped.startswith("flutter:"):
+                  in_flutter, in_assets = True, False
+                  out.append(line); i += 1; continue
+              if indent == 0 and stripped and not stripped.startswith("#"):
+                  in_flutter, in_assets = False, False
+                  out.append(line); i += 1; continue
+              if in_flutter and stripped.startswith("assets:"):
+                  in_assets = True
+                  out.append(line); i += 1; continue
+              if in_assets and stripped.startswith("- "):
+                  pat = stripped[2:].strip().strip("\"'").split("?")[0]
+                  if pat.startswith(("http://", "https://", "data:")):
+                      out.append(line); i += 1; continue
+                  hits = glob.glob(pat, recursive=True) if any(c in pat for c in "*?[") else (
+                      [pat] if os.path.exists(pat) else [])
+                  if hits:
+                      out.append(line)
+                  else:
+                      print(f"preview-builder: dropping missing asset '{pat}'")
+                  i += 1; continue
+              out.append(line); i += 1
+          open(p, "w").write("\n".join(out))
+          print("preview-builder: pubspec assets sanitized")
+          EOF
+
       # No storage secrets in this step: it runs the app's own dependencies.
       - name: Build Flutter web
         working-directory: app
@@ -41,7 +138,7 @@ jobs:
           set -o pipefail
           {
             [ -d web ] || flutter create . --platforms web
-            flutter pub get
+            flutter pub get || flutter pub upgrade
             flutter build web --release --base-href "/$ID/"
           } 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
